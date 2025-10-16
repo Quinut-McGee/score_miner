@@ -18,6 +18,7 @@ from sports.configs.soccer import SoccerPitchConfiguration
 from miner.utils.device import get_optimal_device
 from miner.utils.model_manager import ModelManager
 from miner.utils.video_processor import VideoProcessor
+from miner.utils.batch_processor import BatchFrameProcessor, NoBatchProcessor
 from miner.utils.shared import miner_lock
 from miner.utils.video_downloader import download_video
 
@@ -58,38 +59,38 @@ async def process_soccer_video(
         
         player_model = model_manager.get_model("player")
         pitch_model = model_manager.get_model("pitch")
-        
+
         tracker = sv.ByteTrack()
-        
+
         tracking_data = {"frames": []}
-        
-        async for frame_number, frame in video_processor.stream_frames(video_path):
-            pitch_result = pitch_model(frame, verbose=False)[0]
-            keypoints = sv.KeyPoints.from_ultralytics(pitch_result)
-            
-            player_result = player_model(frame, imgsz=1280, verbose=False)[0]
-            detections = sv.Detections.from_ultralytics(player_result)
-            detections = tracker.update_with_detections(detections)
-            
-            # Convert numpy arrays to Python native types
-            frame_data = {
-                "frame_number": int(frame_number),  # Convert to native int
-                "keypoints": keypoints.xy[0].tolist() if keypoints and keypoints.xy is not None else [],
-                "objects": [
-                    {
-                        "id": int(tracker_id),  # Convert numpy.int64 to native int
-                        "bbox": [float(x) for x in bbox],  # Convert numpy.float32/64 to native float
-                        "class_id": int(class_id)  # Convert numpy.int64 to native int
-                    }
-                    for tracker_id, bbox, class_id in zip(
-                        detections.tracker_id,
-                        detections.xyxy,
-                        detections.class_id
-                    )
-                ] if detections and detections.tracker_id is not None else []
-            }
+
+        # Get optimized inference parameters from model manager
+        player_kwargs = model_manager.inference_config.get_player_inference_kwargs()
+        pitch_kwargs = model_manager.inference_config.get_pitch_inference_kwargs()
+
+        # Choose batch processor based on batch size
+        batch_size = model_manager.inference_config.batch_size
+        if batch_size > 1:
+            processor = BatchFrameProcessor(batch_size=batch_size)
+            logger.info(f"Using batch processing with batch_size={batch_size}")
+        else:
+            processor = NoBatchProcessor()
+            logger.info("Using sequential processing (batch_size=1)")
+
+        # Process frames with batching (or sequential if batch_size=1)
+        frame_generator = video_processor.stream_frames(video_path)
+        async for frame_data in processor.process_batched_frames(
+            frame_generator,
+            player_model,
+            pitch_model,
+            tracker,
+            player_kwargs,
+            pitch_kwargs,
+        ):
             tracking_data["frames"].append(frame_data)
-            
+
+            # Log progress every 100 frames
+            frame_number = frame_data["frame_number"]
             if frame_number % 100 == 0:
                 elapsed = time.time() - start_time
                 fps = frame_number / elapsed if elapsed > 0 else 0

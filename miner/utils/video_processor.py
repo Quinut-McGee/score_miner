@@ -1,6 +1,7 @@
 import asyncio
 import time
-from typing import AsyncGenerator, Optional, Tuple
+from typing import AsyncGenerator, Optional, Tuple, List
+from collections import deque
 import cv2
 import numpy as np
 import supervision as sv
@@ -15,8 +16,10 @@ class VideoProcessor:
         cuda_timeout: float = 900.0,  # 15 minutes for CUDA
         mps_timeout: float = 1800.0,  # 30 minutes for MPS
         cpu_timeout: float = 10800.0,  # 3 hours for CPU
+        prefetch_frames: int = 64,  # Number of frames to prefetch ahead
     ):
         self.device = device
+        self.prefetch_frames = prefetch_frames
         # Set timeout based on device
         if device == "cuda":
             self.processing_timeout = cuda_timeout
@@ -24,31 +27,34 @@ class VideoProcessor:
             self.processing_timeout = mps_timeout
         else:  # cpu or any other device
             self.processing_timeout = cpu_timeout
-            
-        logger.info(f"Video processor initialized with {device} device, timeout: {self.processing_timeout:.1f}s")
+
+        logger.info(f"Video processor initialized with {device} device, timeout: {self.processing_timeout:.1f}s, prefetch={prefetch_frames}")
     
     async def stream_frames(
         self,
         video_path: str
     ) -> AsyncGenerator[Tuple[int, np.ndarray], None]:
         """
-        Stream video frames asynchronously with timeout protection.
+        Stream video frames asynchronously with batch prefetching.
         Process ALL frames regardless of compute device.
-        
+
         Args:
             video_path: Path to the video file
-            
+
         Yields:
             Tuple[int, np.ndarray]: Frame number and frame data
         """
         start_time = time.time()
         cap = cv2.VideoCapture(str(video_path))
-        
+
         if not cap.isOpened():
             raise ValueError(f"Could not open video file: {video_path}")
-        
+
         try:
             frame_count = 0
+            frame_buffer = []
+
+            # Read frames in batches to minimize overhead
             while True:
                 elapsed_time = time.time() - start_time
                 if elapsed_time > self.processing_timeout:
@@ -57,22 +63,32 @@ class VideoProcessor:
                         f"on {self.device} device ({frame_count} frames processed)"
                     )
                     break
-                
-                # Use run_in_executor to prevent blocking the event loop
-                ret, frame = await asyncio.get_event_loop().run_in_executor(
-                    None, cap.read
-                )
-                
-                if not ret:
-                    logger.info(f"Completed processing {frame_count} frames in {elapsed_time:.1f}s on {self.device} device")
-                    break
-                
+
+                # Read a batch of frames at once (reduces cap.read() overhead)
+                if not frame_buffer:
+                    # Read multiple frames in one executor call to reduce context switching
+                    def read_batch(batch_size: int):
+                        frames = []
+                        for _ in range(batch_size):
+                            ret, frame = cap.read()
+                            if not ret:
+                                break
+                            frames.append(frame)
+                        return frames
+
+                    frame_buffer = await asyncio.get_event_loop().run_in_executor(
+                        None, read_batch, self.prefetch_frames
+                    )
+
+                    if not frame_buffer:
+                        logger.info(f"Completed processing {frame_count} frames in {elapsed_time:.1f}s on {self.device} device")
+                        break
+
+                # Yield frames from buffer
+                frame = frame_buffer.pop(0)
                 yield frame_count, frame
                 frame_count += 1
-                
-                # Small delay to prevent CPU hogging while still processing all frames
-                await asyncio.sleep(0)
-        
+
         finally:
             cap.release()
     

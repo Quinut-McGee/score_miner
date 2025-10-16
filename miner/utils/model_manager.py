@@ -1,27 +1,46 @@
+import os
 from pathlib import Path
 from typing import Dict, Optional
 from ultralytics import YOLO
 from loguru import logger
 
 from miner.utils.device import get_optimal_device
+from miner.core.models.inference_config import InferenceConfig
 from scripts.download_models import download_models
 
 class ModelManager:
     """Manages the loading and caching of YOLO models."""
-    
-    def __init__(self, device: Optional[str] = None):
+
+    def __init__(self, device: Optional[str] = None, batch_size: Optional[int] = None):
         self.device = get_optimal_device(device)
         self.models: Dict[str, YOLO] = {}
         self.data_dir = Path(__file__).parent.parent / "data"
         self.data_dir.mkdir(exist_ok=True)
-        
+
         # Define model paths
         self.model_paths = {
             "player": self.data_dir / "football-player-detection.pt",
             "pitch": self.data_dir / "football-pitch-detection.pt",
             "ball": self.data_dir / "football-ball-detection.pt"
         }
-        
+
+        # Read batch size from environment if not provided
+        if batch_size is None:
+            batch_size_env = os.getenv("BATCH_SIZE")
+            if batch_size_env is not None:
+                try:
+                    batch_size = int(batch_size_env)
+                    logger.info(f"Using BATCH_SIZE from environment: {batch_size}")
+                except ValueError:
+                    logger.warning(f"Invalid BATCH_SIZE in environment: {batch_size_env}, using default")
+
+        # Load inference configuration optimized for this device
+        self.inference_config = InferenceConfig.for_device(self.device, batch_size_override=batch_size)
+        logger.info(f"Loaded inference config for {self.device}: "
+                   f"player_imgsz={self.inference_config.player_imgsz}, "
+                   f"half={self.inference_config.half_precision}, "
+                   f"batch_size={self.inference_config.batch_size}")
+
         # Check if models exist, download if missing
         self._ensure_models_exist()
     
