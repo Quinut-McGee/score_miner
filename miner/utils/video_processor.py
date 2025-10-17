@@ -43,7 +43,7 @@ class VideoProcessor:
     
     async def stream_frames(
         self,
-        video_path: str
+        video_source: str
     ) -> AsyncGenerator[Tuple[int, np.ndarray], None]:
         """
         Stream video frames asynchronously with continuous background decode.
@@ -59,14 +59,15 @@ class VideoProcessor:
         start_time = time.time()
 
         use_nvdec = os.getenv('USE_NVDEC', '1') in ('1', 'true', 'True') and self.device == 'cuda'
+        is_url = isinstance(video_source, str) and (video_source.startswith('http://') or video_source.startswith('https://'))
         q: "queue.Queue[Tuple[int, np.ndarray] | None]" = queue.Queue(maxsize=max(2, self.prefetch_frames))
         stop_flag = threading.Event()
 
         if use_nvdec:
             # Probe width/height quickly via OpenCV (fast enough)
-            cap_probe = cv2.VideoCapture(str(video_path))
+            cap_probe = cv2.VideoCapture(str(video_source))
             if not cap_probe.isOpened():
-                raise ValueError(f"Could not open video file: {video_path}")
+                raise ValueError(f"Could not open video source: {video_source}")
             width = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
             height = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
             cap_probe.release()
@@ -74,7 +75,7 @@ class VideoProcessor:
                 use_nvdec = False
 
         def reader_opencv() -> None:
-            cap = cv2.VideoCapture(str(video_path))
+            cap = cv2.VideoCapture(str(video_source))
             # Best-effort low-latency settings
             if self.device == "cuda":
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
@@ -115,8 +116,10 @@ class VideoProcessor:
         def reader_nvdec() -> None:
             # Use ffmpeg with NVDEC to decode and pipe BGR frames
             # Apply stride with select to reduce decode work
+            input_arg = shlex.quote(str(video_source))
+            # If URL, let ffmpeg stream directly (fast start)
             cmd = (
-                f"ffmpeg -v error -hwaccel cuda -c:v h264_cuvid -i {shlex.quote(str(video_path))} "
+                f"ffmpeg -v error -hwaccel cuda -c:v h264_cuvid -i {input_arg} "
                 f"-vf select='not(mod(n,{max(1, self.frame_stride)}))' "
                 f"-f rawvideo -pix_fmt bgr24 -"
             )

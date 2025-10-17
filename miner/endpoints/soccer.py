@@ -37,8 +37,9 @@ def get_model_manager(config: Config = Depends(get_config)) -> ModelManager:
     return model_manager
 
 async def process_soccer_video(
-    video_path: str,
+    video_source: str,
     model_manager: ModelManager,
+    is_url: bool = False,
 ) -> Dict[str, Any]:
     """Process a soccer video and return tracking data."""
     start_time = time.time()
@@ -55,11 +56,12 @@ async def process_soccer_video(
             frame_stride=2        # SPEED OPTIMIZED: Process every 2nd frame (2x speedup)
         )
         
-        if not await video_processor.ensure_video_readable(video_path):
-            raise HTTPException(
-                status_code=400,
-                detail="Video file is not readable or corrupted"
-            )
+        if not is_url:
+            if not await video_processor.ensure_video_readable(video_source):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Video file is not readable or corrupted"
+                )
         
         player_model = model_manager.get_model("player")
         pitch_model = model_manager.get_model("pitch")
@@ -82,7 +84,7 @@ async def process_soccer_video(
             logger.info("Using sequential processing (batch_size=1)")
 
         # OPTIMIZATION: Process frames with streaming JSON conversion
-        frame_generator = video_processor.stream_frames(video_path)
+        frame_generator = video_processor.stream_frames(video_source)
         frames_list = []
         
         # Pre-allocate list for better memory performance
@@ -184,9 +186,14 @@ async def process_challenge(
                 logger.info("Continuing without waiting for warmup to fully complete")
 
             try:
+                # If DIRECT_URL_STREAM is enabled, bypass local file and stream directly from URL
+                direct_url = os.getenv("DIRECT_URL_STREAM", "1") in ("1", "true", "True")
+                source = video_url if (use_streaming and direct_url) else str(video_path)
+                is_url = use_streaming and direct_url
                 tracking_data = await process_soccer_video(
-                    video_path,
-                    model_manager
+                    source,
+                    model_manager,
+                    is_url=is_url
                 )
                 
                 response = {
@@ -200,7 +207,8 @@ async def process_challenge(
                 
             finally:
                 try:
-                    os.unlink(video_path)
+                    if not is_url:
+                        os.unlink(video_path)
                 except:
                     pass
                 # Ensure streaming download finishes and cleans up
