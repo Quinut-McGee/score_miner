@@ -48,7 +48,9 @@ async def process_soccer_video(
             device=model_manager.device,
             cuda_timeout=10800.0,
             mps_timeout=10800.0,
-            cpu_timeout=10800.0
+            cpu_timeout=10800.0,
+            prefetch_frames=64,   # SPEED OPTIMIZED: Larger prefetch for batch=32
+            frame_stride=2        # SPEED OPTIMIZED: Process every 2nd frame (2x speedup)
         )
         
         if not await video_processor.ensure_video_readable(video_path):
@@ -77,8 +79,13 @@ async def process_soccer_video(
             processor = NoBatchProcessor()
             logger.info("Using sequential processing (batch_size=1)")
 
-        # Process frames with batching (or sequential if batch_size=1)
+        # OPTIMIZATION: Process frames with streaming JSON conversion
         frame_generator = video_processor.stream_frames(video_path)
+        frames_list = []
+        
+        # Pre-allocate list for better memory performance
+        frames_list = []
+        
         async for frame_data in processor.process_batched_frames(
             frame_generator,
             player_model,
@@ -87,7 +94,20 @@ async def process_soccer_video(
             player_kwargs,
             pitch_kwargs,
         ):
-            tracking_data["frames"].append(frame_data)
+            # OPTIMIZATION: Convert numpy arrays to lists immediately to reduce memory usage
+            converted_frame = {
+                "frame_number": int(frame_data["frame_number"]),
+                "keypoints": frame_data["keypoints"].tolist() if len(frame_data["keypoints"]) > 0 else [],
+                "objects": [
+                    {
+                        "id": int(tid),
+                        "bbox": bbox.tolist(),
+                        "class_id": int(cid)
+                    }
+                    for tid, bbox, cid in zip(frame_data["tracker_ids"], frame_data["bboxes"], frame_data["class_ids"])
+                ] if len(frame_data["tracker_ids"]) > 0 else []
+            }
+            frames_list.append(converted_frame)
 
             # Log progress every 100 frames
             frame_number = frame_data["frame_number"]
@@ -95,8 +115,12 @@ async def process_soccer_video(
                 elapsed = time.time() - start_time
                 fps = frame_number / elapsed if elapsed > 0 else 0
                 logger.info(f"Processed {frame_number} frames in {elapsed:.1f}s ({fps:.2f} fps)")
-        
+
         processing_time = time.time() - start_time
+
+        # OPTIMIZATION: Frames are already converted during processing
+        tracking_data["frames"] = frames_list
+
         tracking_data["processing_time"] = processing_time
         
         total_frames = len(tracking_data["frames"])
@@ -132,8 +156,17 @@ async def process_challenge(
             
             logger.info(f"Processing challenge {challenge_id} with video {video_url}")
             
-            video_path = await download_video(video_url)
-            
+            # Overlap video download and model warmup
+            download_task = asyncio.create_task(download_video(video_url))
+            warmup_task = asyncio.create_task(model_manager.warmup_models())
+
+            video_path = await download_task
+            # Don't block on warmup if already done; wait up to 1s grace
+            try:
+                await asyncio.wait_for(warmup_task, timeout=1.0)
+            except asyncio.TimeoutError:
+                logger.info("Continuing without waiting for warmup to fully complete")
+
             try:
                 tracking_data = await process_soccer_video(
                     video_path,

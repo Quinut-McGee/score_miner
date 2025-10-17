@@ -156,3 +156,4 @@ Our team combines extensive expertise in computer vision, sports technology, and
 ## License
 
 This project is licensed under the MIT License. Full details are available in the [LICENSE](LICENSE) file.
+# score_miner

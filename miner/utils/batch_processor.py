@@ -100,7 +100,7 @@ class BatchFrameProcessor:
         pitch_kwargs: dict,
     ) -> AsyncGenerator[dict, None]:
         """
-        Process a single batch of frames.
+        Process a single batch of frames with CUDA streams for true parallelism.
 
         Args:
             frames: List of frame arrays
@@ -115,31 +115,62 @@ class BatchFrameProcessor:
             dict: Frame data for each frame in the batch
         """
         batch_size = len(frames)
+        
+        # SPEED OPTIMIZED: Use CUDA streams for truly parallel execution
+        import torch
+        use_cuda_streams = torch.cuda.is_available() and hasattr(torch.cuda, 'Stream')
 
-        # Run batch inference for pitch keypoints
-        # Note: Some models may not support true batching, so we handle both cases
-        try:
-            if batch_size > 1:
-                # Try batch inference
-                pitch_results = pitch_model(frames, **pitch_kwargs)
-            else:
-                # Single frame
-                pitch_results = [pitch_model(frames[0], **pitch_kwargs)[0]]
-        except Exception as e:
-            # Fallback to sequential if batch fails
-            logger.warning(f"Batch pitch inference failed, falling back to sequential: {e}")
-            pitch_results = [pitch_model(frame, **pitch_kwargs)[0] for frame in frames]
+        def run_pitch():
+            try:
+                # Enable stream context if CUDA is available
+                if use_cuda_streams:
+                    with torch.cuda.stream(torch.cuda.Stream()):
+                        if batch_size > 1:
+                            return pitch_model(frames, **pitch_kwargs)
+                        else:
+                            return [pitch_model(frames[0], **pitch_kwargs)[0]]
+                else:
+                    if batch_size > 1:
+                        return pitch_model(frames, **pitch_kwargs)
+                    else:
+                        return [pitch_model(frames[0], **pitch_kwargs)[0]]
+            except Exception as e:
+                logger.warning(f"Batch pitch inference failed, falling back to sequential: {e}")
+                return [pitch_model(frame, **pitch_kwargs)[0] for frame in frames]
 
-        # Run batch inference for player detection
-        try:
-            if batch_size > 1:
-                player_results = player_model(frames, **player_kwargs)
-            else:
-                player_results = [player_model(frames[0], **player_kwargs)[0]]
-        except Exception as e:
-            # Fallback to sequential if batch fails
-            logger.warning(f"Batch player inference failed, falling back to sequential: {e}")
-            player_results = [player_model(frame, **player_kwargs)[0] for frame in frames]
+        def run_player():
+            try:
+                # Enable stream context if CUDA is available
+                if use_cuda_streams:
+                    with torch.cuda.stream(torch.cuda.Stream()):
+                        if batch_size > 1:
+                            return player_model(frames, **player_kwargs)
+                        else:
+                            return [player_model(frames[0], **player_kwargs)[0]]
+                else:
+                    if batch_size > 1:
+                        return player_model(frames, **player_kwargs)
+                    else:
+                        return [player_model(frames[0], **player_kwargs)[0]]
+            except Exception as e:
+                logger.warning(f"Batch player inference failed, falling back to sequential: {e}")
+                return [player_model(frame, **player_kwargs)[0] for frame in frames]
+
+        # SPEED OPTIMIZED: Execute both models concurrently with CUDA streams
+        # ThreadPoolExecutor allows true parallelism with separate CUDA streams
+        import concurrent.futures
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            pitch_future = executor.submit(run_pitch)
+            player_future = executor.submit(run_player)
+            
+            # Wait for both to complete
+            pitch_results = pitch_future.result()
+            player_results = player_future.result()
+        
+        # Synchronize CUDA if streams were used
+        if use_cuda_streams:
+            torch.cuda.synchronize()
 
         # Process each frame in the batch
         for i, (frame_number, pitch_result, player_result) in enumerate(
@@ -152,22 +183,14 @@ class BatchFrameProcessor:
             detections = sv.Detections.from_ultralytics(player_result)
             detections = tracker.update_with_detections(detections)
 
-            # Build frame data
+            # Build frame data (optimized - minimal conversion)
+            # Store numpy arrays directly, convert to lists in bulk later
             frame_data = {
-                "frame_number": int(frame_number),
-                "keypoints": keypoints.xy[0].tolist() if keypoints and keypoints.xy is not None else [],
-                "objects": [
-                    {
-                        "id": int(tracker_id),
-                        "bbox": [float(x) for x in bbox],
-                        "class_id": int(class_id)
-                    }
-                    for tracker_id, bbox, class_id in zip(
-                        detections.tracker_id,
-                        detections.xyxy,
-                        detections.class_id
-                    )
-                ] if detections and detections.tracker_id is not None else []
+                "frame_number": frame_number,  # Keep as int, don't convert
+                "keypoints": keypoints.xy[0] if keypoints and keypoints.xy is not None else np.array([]),
+                "tracker_ids": detections.tracker_id if detections and detections.tracker_id is not None else np.array([]),
+                "bboxes": detections.xyxy if detections and detections.xyxy is not None else np.array([]),
+                "class_ids": detections.class_id if detections and detections.class_id is not None else np.array([])
             }
 
             yield frame_data
@@ -205,22 +228,14 @@ class NoBatchProcessor:
             detections = sv.Detections.from_ultralytics(player_result)
             detections = tracker.update_with_detections(detections)
 
-            # Build frame data
+            # Build frame data (optimized - minimal conversion)
+            # Store numpy arrays directly, convert to lists in bulk later
             frame_data = {
-                "frame_number": int(frame_number),
-                "keypoints": keypoints.xy[0].tolist() if keypoints and keypoints.xy is not None else [],
-                "objects": [
-                    {
-                        "id": int(tracker_id),
-                        "bbox": [float(x) for x in bbox],
-                        "class_id": int(class_id)
-                    }
-                    for tracker_id, bbox, class_id in zip(
-                        detections.tracker_id,
-                        detections.xyxy,
-                        detections.class_id
-                    )
-                ] if detections and detections.tracker_id is not None else []
+                "frame_number": frame_number,  # Keep as int, don't convert
+                "keypoints": keypoints.xy[0] if keypoints and keypoints.xy is not None else np.array([]),
+                "tracker_ids": detections.tracker_id if detections and detections.tracker_id is not None else np.array([]),
+                "bboxes": detections.xyxy if detections and detections.xyxy is not None else np.array([]),
+                "class_ids": detections.class_id if detections and detections.class_id is not None else np.array([])
             }
 
             yield frame_data

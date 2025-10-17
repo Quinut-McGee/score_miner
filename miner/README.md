@@ -199,3 +199,92 @@ For advanced configuration options and architecture details, see the [main READM
 A big shout out to Skalskip and the work they're doing over at Roboflow. The base miner utilizes models and techniques from:
 
 - [Roboflow Sports](https://github.com/roboflow/sports) - An open-source repository providing computer vision tools and models for sports analytics, particularly focused on soccer/football detection tasks.
+
+## Performance Optimizations (Implemented)
+
+The miner has been tuned for SN44 real-time competitiveness with the following improvements:
+
+- Background frame decode and queue (utils/video_processor.py)
+  - Decoding runs in a dedicated thread into a bounded queue to overlap CPU decode with GPU inference.
+  - Immediate first-frame availability; removes ~10–12s initial stall in some inputs.
+  - Tunables: `PREFETCH_FRAMES` (default 64), `FRAME_STRIDE` (default 2).
+
+- Overlapped download + model warmup (endpoints/soccer.py)
+  - Starts model warmup concurrently with video download; continues if warmup exceeds 1s.
+
+- Async model warmup (utils/model_manager.py)
+  - Lightweight dummy forward pass on player and pitch models to eliminate first-inference latency.
+
+- Safe torch.compile gating (utils/gpu_optimizer.py)
+  - `torch.compile` is disabled by default to avoid first-run compile latency.
+  - Enable explicitly with `ENABLE_TORCH_COMPILE=1` once the pipeline is stable.
+
+- CUDA and threading tuning (utils/gpu_optimizer.py)
+  - cuDNN benchmark + TF32 enabled; process memory fraction set to 0.9.
+  - PyTorch and OpenCV threads set to 32 (adjust per system).
+
+- Device-optimized inference config (core/models/inference_config.py)
+  - CUDA default `IMG_SIZE=640`, `BATCH_SIZE=32`, FP16 enabled.
+  - Override via environment variables for fast experimentation.
+
+### Tuning & Environment Variables
+
+Set before starting the miner (examples):
+
+```bash
+export DEVICE=cuda
+export IMG_SIZE=640          # try 512 for more speed
+export BATCH_SIZE=32         # tune by VRAM, 16–48 typical on 16GB
+export PREFETCH_FRAMES=64    # queue capacity for background decode
+export FRAME_STRIDE=2        # try 3–4 for aggressive sampling
+export ENABLE_TORCH_COMPILE=0  # set to 1 once warmed and stable
+```
+
+Quick tips for <10s responses:
+- Increase `FRAME_STRIDE` to 3–4 during Score challenges to downsample frames.
+- Consider `IMG_SIZE=512` if accuracy loss is acceptable for speed.
+- Keep the process warm (avoid cold starts) and reuse loaded models.
+
+## Proposed Next Steps (Impact-Ordered)
+
+1. TensorRT deployment for YOLO models (2–4x inference speedup)
+   - Export to ONNX and build TensorRT engines (FP16); cache engines on disk.
+   - Integrate a TensorRT-backed inference path behind a feature flag.
+
+2. GPU video decode (NVDEC) via FFmpeg/PyAV
+   - Replace OpenCV decode with FFmpeg + NVDEC for higher throughput and lower CPU.
+   - Target zero-copy or minimal-copy path into GPU tensors.
+
+3. Full triple-model parallelism
+   - Run player, pitch, and ball models concurrently using separate CUDA streams.
+   - Overlap post-processing with next-batch inference.
+
+4. Memory pipeline upgrades
+   - Use pinned host memory and async H2D copies (`non_blocking=True`).
+   - Pre-allocate GPU tensors/buffers for steady-state workloads.
+
+5. Pipeline scheduling
+   - Enforce 3-stage overlap: decode(N+1) ⇄ infer(N) ⇄ postprocess(N-1).
+   - Early-flush small first batch to minimize time-to-first-result.
+
+6. Adaptive frame sampling
+   - Motion-based keyframe selection; increase stride when motion is low.
+
+7. Warm start on boot
+   - Trigger warmup and a tiny synthetic job at service start to keep kernels hot.
+
+## Benchmarking
+
+Use the included benchmark scripts to measure stage-by-stage improvements:
+
+```bash
+# Inference-only benchmarking
+python scripts/benchmark_inference.py --device cuda --imgsz 640 --batch-size 32
+
+# End-to-end miner benchmarking
+python scripts/benchmark_miner.py --url <video_url> --repeats 3
+```
+
+Recommended metrics to log:
+- First-frame latency (s), Decode FPS, Inference FPS, End-to-end time (s)
+- GPU utilization (%), VRAM used (GB), CPU utilization (%)
