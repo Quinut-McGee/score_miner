@@ -64,14 +64,28 @@ class VideoProcessor:
         stop_flag = threading.Event()
 
         if use_nvdec:
-            # Probe width/height quickly via OpenCV (fast enough)
-            cap_probe = cv2.VideoCapture(str(video_source))
-            if not cap_probe.isOpened():
-                raise ValueError(f"Could not open video source: {video_source}")
-            width = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
-            height = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
-            cap_probe.release()
+            width = 0
+            height = 0
+            try:
+                # Try ffprobe first for URLs (faster/more reliable metadata)
+                if is_url:
+                    probe_cmd = f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x {shlex.quote(str(video_source))}"
+                    out = subprocess.check_output(shlex.split(probe_cmd), stderr=subprocess.DEVNULL, timeout=2)
+                    parts = out.decode().strip().split('x')
+                    if len(parts) == 2:
+                        width = int(parts[0])
+                        height = int(parts[1])
+                if width <= 0 or height <= 0:
+                    # Fallback to OpenCV probe for local files or if ffprobe failed
+                    cap_probe = cv2.VideoCapture(str(video_source))
+                    if cap_probe.isOpened():
+                        width = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
+                        height = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
+                    cap_probe.release()
+            except Exception:
+                pass
             if width <= 0 or height <= 0:
+                logger.warning("NVDEC probe failed to get dimensions; falling back to OpenCV decode")
                 use_nvdec = False
 
         def reader_opencv() -> None:
@@ -144,7 +158,11 @@ class VideoProcessor:
                     if proc.stdout is None:
                         break
                     # If no data yet, avoid busy-waiting on empty pipe
-                    if proc.stdout.peek(1) if hasattr(proc.stdout, 'peek') else True:
+                    if hasattr(proc.stdout, 'peek'):
+                        ready = len(proc.stdout.peek(1)) > 0
+                    else:
+                        ready = True
+                    if ready:
                         buf = proc.stdout.read(frame_size)
                     else:
                         if time.time() > startup_deadline:

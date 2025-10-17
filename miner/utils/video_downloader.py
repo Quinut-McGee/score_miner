@@ -102,6 +102,8 @@ async def download_video_streaming(url: str):
                 # Wait for initial buffering to avoid partial-file decoder errors
                 # Require at least MIN_START_BYTES or 0.5s timeout
                 min_bytes = int(os.getenv("STREAM_MIN_START_BYTES", str(3 * 1024 * 1024)))
+                # Clamp to avoid misconfiguration (0.5MB..16MB)
+                min_bytes = max(512 * 1024, min(min_bytes, 16 * 1024 * 1024))
                 start_deadline = asyncio.get_event_loop().time() + float(os.getenv("STREAM_BUFFER_TIMEOUT_S", "1.0"))
                 while True:
                     try:
