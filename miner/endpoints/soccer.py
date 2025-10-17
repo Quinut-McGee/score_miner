@@ -9,6 +9,7 @@ from pydantic import BaseModel
 import asyncio
 from pathlib import Path
 from loguru import logger
+import shutil
 
 from fiber.logging_utils import get_logger
 from miner.core.models.config import Config
@@ -188,13 +189,28 @@ async def process_challenge(
             try:
                 # If DIRECT_URL_STREAM is enabled, bypass local file and stream directly from URL
                 direct_url = os.getenv("DIRECT_URL_STREAM", "1") in ("1", "true", "True")
+                ffmpeg_available = shutil.which("ffmpeg") is not None
+                if use_streaming and direct_url and not ffmpeg_available:
+                    logger.info("Disabling DIRECT_URL_STREAM: ffmpeg not found on PATH")
+                    direct_url = False
+
                 source = video_url if (use_streaming and direct_url) else str(video_path)
                 is_url = use_streaming and direct_url
+
                 tracking_data = await process_soccer_video(
                     source,
                     model_manager,
                     is_url=is_url
                 )
+
+                # Fallback: if direct URL produced zero frames, retry with local file path
+                if is_url and (not tracking_data.get("frames")):
+                    logger.warning("Direct URL streaming returned 0 frames, retrying with local file")
+                    tracking_data = await process_soccer_video(
+                        str(video_path),
+                        model_manager,
+                        is_url=False
+                    )
                 
                 response = {
                     "challenge_id": challenge_id,

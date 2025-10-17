@@ -206,10 +206,6 @@ class VideoProcessor:
                 yielded_frame_count += 1
         finally:
             stop_flag.set()
-            try:
-                cap.release()
-            except Exception:
-                pass
     
     @staticmethod
     def get_video_info(video_path: str) -> sv.VideoInfo:
