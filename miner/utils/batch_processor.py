@@ -35,6 +35,9 @@ class BatchFrameProcessor:
         self.first_batch_target = int(os.getenv("RAMP_UP_FIRST_BATCH", str(max(1, min(8, batch_size // 4)))))
         # Executor for overlapping batch inference and CPU postprocessing
         self._batch_executor: Optional[concurrent.futures.ThreadPoolExecutor] = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        # Optional fast-mode toggles
+        self.disable_tracking = os.getenv("DISABLE_TRACKING", "0") in ("1", "true", "True")
+        self.skip_pitch = os.getenv("SKIP_PITCH", "0") in ("1", "true", "True")
         logger.info(f"BatchFrameProcessor initialized with batch_size={batch_size}")
 
     async def process_batched_frames(
@@ -172,12 +175,15 @@ class BatchFrameProcessor:
         tracker: sv.ByteTrack,
     ) -> AsyncGenerator[dict, None]:
         for frame_number, pitch_result, player_result in zip(frame_numbers, pitch_results, player_results):
-            keypoints = sv.KeyPoints.from_ultralytics(pitch_result)
+            keypoints = None
+            if not self.skip_pitch:
+                keypoints = sv.KeyPoints.from_ultralytics(pitch_result)
             detections = sv.Detections.from_ultralytics(player_result)
-            detections = tracker.update_with_detections(detections)
+            if not self.disable_tracking and tracker is not None:
+                detections = tracker.update_with_detections(detections)
             frame_data = {
                 "frame_number": frame_number,
-                "keypoints": keypoints.xy[0] if keypoints and keypoints.xy is not None else np.array([]),
+                "keypoints": keypoints.xy[0] if (keypoints is not None and keypoints.xy is not None) else np.array([]),
                 "tracker_ids": detections.tracker_id if detections and detections.tracker_id is not None else np.array([]),
                 "bboxes": detections.xyxy if detections and detections.xyxy is not None else np.array([]),
                 "class_ids": detections.class_id if detections and detections.class_id is not None else np.array([])

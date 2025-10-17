@@ -5,6 +5,8 @@ from typing import AsyncGenerator, Optional, Tuple, List
 from collections import deque
 import threading
 import queue
+import subprocess
+import shlex
 import cv2
 import numpy as np
 import supervision as sv
@@ -55,43 +57,45 @@ class VideoProcessor:
             Tuple[int, np.ndarray]: Frame index (sequential) and frame data
         """
         start_time = time.time()
-        cap = cv2.VideoCapture(str(video_path))
 
-        # Best-effort low-latency settings
-        if self.device == "cuda":
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        if not cap.isOpened():
-            raise ValueError(f"Could not open video file: {video_path}")
-
+        use_nvdec = os.getenv('USE_NVDEC', '1') in ('1', 'true', 'True') and self.device == 'cuda'
         q: "queue.Queue[Tuple[int, np.ndarray] | None]" = queue.Queue(maxsize=max(2, self.prefetch_frames))
         stop_flag = threading.Event()
 
-        def reader() -> None:
+        if use_nvdec:
+            # Probe width/height quickly via OpenCV (fast enough)
+            cap_probe = cv2.VideoCapture(str(video_path))
+            if not cap_probe.isOpened():
+                raise ValueError(f"Could not open video file: {video_path}")
+            width = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
+            height = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
+            cap_probe.release()
+            if width <= 0 or height <= 0:
+                use_nvdec = False
+
+        def reader_opencv() -> None:
+            cap = cv2.VideoCapture(str(video_path))
+            # Best-effort low-latency settings
+            if self.device == "cuda":
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             try:
                 frames_read = 0
-                # Consume frames, applying stride by skipping reads
                 while not stop_flag.is_set():
-                    # Read the next frame we intend to keep
                     ret, frame = cap.read()
                     if not ret:
                         break
                     frames_read += 1
 
-                    # Apply stride by skipping additional frames between yields
-                    # We already read one above to keep; now skip stride-1
                     for _ in range(max(0, self.frame_stride - 1)):
                         ret_skip, _ = cap.read()
                         if not ret_skip:
                             break
                         frames_read += 1
 
-                    # Block if queue is full (backpressure while GPU runs)
                     try:
                         q.put((frames_read - 1, frame), timeout=0.5)
                     except queue.Full:
-                        # If consumer is slower, try again unless stopping
                         while not stop_flag.is_set():
                             try:
                                 q.put((frames_read - 1, frame), timeout=0.5)
@@ -99,13 +103,76 @@ class VideoProcessor:
                             except queue.Full:
                                 continue
             finally:
-                # Signal completion
                 try:
                     q.put(None, timeout=0.1)
                 except Exception:
                     pass
+                try:
+                    cap.release()
+                except Exception:
+                    pass
 
-        t = threading.Thread(target=reader, name="VideoReader", daemon=True)
+        def reader_nvdec() -> None:
+            # Use ffmpeg with NVDEC to decode and pipe BGR frames
+            # Apply stride with select to reduce decode work
+            cmd = (
+                f"ffmpeg -v error -hwaccel cuda -c:v h264_cuvid -i {shlex.quote(str(video_path))} "
+                f"-vf select='not(mod(n,{max(1, self.frame_stride)}))' "
+                f"-f rawvideo -pix_fmt bgr24 -"
+            )
+            try:
+                proc = subprocess.Popen(
+                    shlex.split(cmd),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=10**8
+                )
+            except Exception as e:
+                logger.warning(f"Failed to start NVDEC ffmpeg pipeline, falling back to OpenCV: {e}")
+                reader_opencv()
+                return
+
+            frame_size = width * height * 3
+            frames_read = 0
+            try:
+                while not stop_flag.is_set():
+                    if proc.stdout is None:
+                        break
+                    buf = proc.stdout.read(frame_size)
+                    if not buf or len(buf) < frame_size:
+                        break
+                    frame = np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 3))
+                    frames_read += self.frame_stride  # approximate index advance with stride
+                    try:
+                        q.put((frames_read - 1, frame), timeout=0.5)
+                    except queue.Full:
+                        while not stop_flag.is_set():
+                            try:
+                                q.put((frames_read - 1, frame), timeout=0.5)
+                                break
+                            except queue.Full:
+                                continue
+            finally:
+                try:
+                    q.put(None, timeout=0.1)
+                except Exception:
+                    pass
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    if proc.stderr:
+                        proc.stderr.close()
+                except Exception:
+                    pass
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=(reader_nvdec if use_nvdec else reader_opencv), name="VideoReader", daemon=True)
         t.start()
 
         yielded_frame_count = 0
