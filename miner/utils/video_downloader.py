@@ -67,7 +67,7 @@ async def download_video(url: str) -> Path:
         raise HTTPException(status_code=500, detail=f"Failed to download video: {str(e)}")
 
 
-async def download_video_streaming(url: str) -> Path:
+async def download_video_streaming(url: str):
     """
     ADVANCED: Download video with true streaming support.
     Allows video processing to start while download is in progress.
@@ -102,8 +102,7 @@ async def download_video_streaming(url: str) -> Path:
                 # Wait a bit for initial buffering
                 await asyncio.sleep(0.5)
                 
-                # Return path immediately so processing can start
-                # Note: Caller must await download_task to ensure completion
+                # Return path and download task immediately so processing can start
                 return Path(temp_path), download_task
                 
     except Exception as e:

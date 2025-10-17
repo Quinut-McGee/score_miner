@@ -20,7 +20,7 @@ from miner.utils.model_manager import ModelManager
 from miner.utils.video_processor import VideoProcessor
 from miner.utils.batch_processor import BatchFrameProcessor, NoBatchProcessor
 from miner.utils.shared import miner_lock
-from miner.utils.video_downloader import download_video
+from miner.utils.video_downloader import download_video, download_video_streaming
 
 logger = get_logger(__name__)
 
@@ -157,10 +157,19 @@ async def process_challenge(
             logger.info(f"Processing challenge {challenge_id} with video {video_url}")
             
             # Overlap video download and model warmup
-            download_task = asyncio.create_task(download_video(video_url))
+            # Choose streaming or full download based on env
+            use_streaming = os.getenv("STREAMING_DOWNLOAD", "1") in ("1", "true", "True")
+            if use_streaming:
+                download_task = asyncio.create_task(download_video_streaming(video_url))
+            else:
+                download_task = asyncio.create_task(download_video(video_url))
             warmup_task = asyncio.create_task(model_manager.warmup_models())
 
-            video_path = await download_task
+            if use_streaming:
+                video_path, background_download = await download_task
+            else:
+                video_path = await download_task
+                background_download = None
             # Don't block on warmup if already done; wait up to 1s grace
             try:
                 await asyncio.wait_for(warmup_task, timeout=1.0)
@@ -187,6 +196,12 @@ async def process_challenge(
                     os.unlink(video_path)
                 except:
                     pass
+                # Ensure streaming download finishes and cleans up
+                if background_download is not None:
+                    try:
+                        await asyncio.wait_for(background_download, timeout=0.1)
+                    except Exception:
+                        pass
             
         except HTTPException:
             raise
