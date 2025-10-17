@@ -42,6 +42,8 @@ async def process_soccer_video(
 ) -> Dict[str, Any]:
     """Process a soccer video and return tracking data."""
     start_time = time.time()
+    # Hard time budget cutoff (env-tunable) to stay competitive
+    time_budget_s = float(os.getenv("TIME_BUDGET_S", "8.0"))
     
     try:
         video_processor = VideoProcessor(
@@ -115,6 +117,11 @@ async def process_soccer_video(
                 elapsed = time.time() - start_time
                 fps = frame_number / elapsed if elapsed > 0 else 0
                 logger.info(f"Processed {frame_number} frames in {elapsed:.1f}s ({fps:.2f} fps)")
+
+            # Enforce time budget cutoff
+            if time.time() - start_time >= time_budget_s:
+                logger.info(f"Time budget of {time_budget_s:.1f}s reached, finishing early with {len(frames_list)} frames")
+                break
 
         processing_time = time.time() - start_time
 

@@ -121,8 +121,12 @@ class ModelManager:
 
             bs = max(1, min(4, self.inference_config.batch_size))
             h = w = int(self.inference_config.player_imgsz)
-            # Match model weight dtype; YOLO internals handle autocast/half
-            weight_dtype = next(player.model.parameters()).dtype if any(p.requires_grad for p in player.model.parameters()) else torch.float32
+            # Match model weight dtype; detect from first parameter if present
+            try:
+                first_param = next(player.model.parameters())
+                weight_dtype = first_param.dtype
+            except StopIteration:
+                weight_dtype = torch.float32
             np_dtype = np.float16 if weight_dtype == torch.float16 else np.float32
             dummy = np.zeros((bs, 3, h, w), dtype=np_dtype)
             tensor = torch.from_numpy(dummy).to(self.device, dtype=weight_dtype)

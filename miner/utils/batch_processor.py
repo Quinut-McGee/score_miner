@@ -65,6 +65,9 @@ class BatchFrameProcessor:
 
         first_batch_pending = self.enable_ramp_up
         current_target = self.first_batch_target if first_batch_pending else self.batch_size
+        # Initialize double-buffering state
+        prev_future: Optional[concurrent.futures.Future] = None
+        prev_frame_numbers: List[int] = []
 
         async for frame_number, frame in frame_generator:
             batch_frames.append(frame)
