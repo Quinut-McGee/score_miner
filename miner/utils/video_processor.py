@@ -25,7 +25,10 @@ class VideoProcessor:
         self.device = device
         # Allow environment variable overrides
         self.prefetch_frames = int(os.getenv('PREFETCH_FRAMES', str(prefetch_frames)))
-        self.frame_stride = int(os.getenv('FRAME_STRIDE', str(frame_stride)))
+        # FAST_MODE can push stride higher by default
+        fast_mode = os.getenv('FAST_MODE', '0') in ('1', 'true', 'True')
+        default_stride = 3 if fast_mode and frame_stride <= 2 else frame_stride
+        self.frame_stride = int(os.getenv('FRAME_STRIDE', str(default_stride)))
         # Set timeout based on device
         if device == "cuda":
             self.processing_timeout = cuda_timeout
@@ -34,7 +37,7 @@ class VideoProcessor:
         else:  # cpu or any other device
             self.processing_timeout = cpu_timeout
 
-        logger.info(f"Video processor initialized with {device} device, timeout: {self.processing_timeout:.1f}s, prefetch={prefetch_frames}, frame_stride={frame_stride}")
+        logger.info(f"Video processor initialized with {device} device, timeout: {self.processing_timeout:.1f}s, prefetch={self.prefetch_frames}, frame_stride={self.frame_stride}")
     
     async def stream_frames(
         self,

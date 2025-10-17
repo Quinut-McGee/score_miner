@@ -73,16 +73,17 @@ class InferenceConfig:
         - BATCH_SIZE: Batch size (default 32)
         """
         # Allow environment variable overrides for easy tuning
-        img_size = int(os.getenv('IMG_SIZE', '640'))
+        fast_mode = os.getenv('FAST_MODE', '0') in ('1', 'true', 'True')
+        img_size = int(os.getenv('IMG_SIZE', os.getenv('FAST_IMG_SIZE', '512' if fast_mode else '640')))
         batch_size = int(os.getenv('BATCH_SIZE', '32'))
         
         return cls(
             player_imgsz=img_size,      # SPEED OPTIMIZED: 640px is 2-3x faster than 1024px
             pitch_imgsz=img_size,       # SPEED OPTIMIZED: Smaller for faster keypoint detection
             ball_imgsz=img_size,        # SPEED OPTIMIZED: Consistent size
-            conf_threshold=0.35,        # Higher threshold to reduce post-processing overhead
+            conf_threshold=float(os.getenv('CONF_THRESHOLD', '0.40' if fast_mode else '0.35')),
             iou_threshold=0.5,          # Higher IoU to reduce duplicate detections
-            max_detections=150,         # Reduced for faster NMS processing
+            max_detections=int(os.getenv('MAX_DETECTIONS', '120' if fast_mode else '150')),
             half_precision=True,        # CRITICAL: Use FP16 Tensor Cores
             agnostic_nms=False,         # Keep class-specific NMS
             batch_size=batch_size,      # AGGRESSIVE: RTX 5070 Ti can handle 32 frames easily (8x speedup)

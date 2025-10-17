@@ -27,6 +27,11 @@ class BatchFrameProcessor:
             batch_size: Number of frames to process in each batch
         """
         self.batch_size = batch_size
+        # Ramp-up: start with a smaller first batch to reduce time-to-first-result
+        # Controlled via env RAMP_UP and RAMP_UP_FIRST_BATCH
+        import os
+        self.enable_ramp_up = os.getenv("RAMP_UP", "1") in ("1", "true", "True")
+        self.first_batch_target = int(os.getenv("RAMP_UP_FIRST_BATCH", str(max(1, min(8, batch_size // 4)))))
         logger.info(f"BatchFrameProcessor initialized with batch_size={batch_size}")
 
     async def process_batched_frames(
@@ -55,12 +60,15 @@ class BatchFrameProcessor:
         batch_frames = []
         batch_numbers = []
 
+        first_batch_pending = self.enable_ramp_up
+        current_target = self.first_batch_target if first_batch_pending else self.batch_size
+
         async for frame_number, frame in frame_generator:
             batch_frames.append(frame)
             batch_numbers.append(frame_number)
 
             # Process batch when full or if this is the last frame
-            if len(batch_frames) >= self.batch_size:
+            if len(batch_frames) >= current_target:
                 async for frame_data in self._process_batch(
                     batch_frames,
                     batch_numbers,
@@ -75,6 +83,11 @@ class BatchFrameProcessor:
                 # Reset batch
                 batch_frames = []
                 batch_numbers = []
+
+                # After the first small batch, switch to full size
+                if first_batch_pending:
+                    first_batch_pending = False
+                    current_target = self.batch_size
 
         # Process remaining frames in partial batch
         if batch_frames:
