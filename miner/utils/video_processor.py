@@ -138,10 +138,19 @@ class VideoProcessor:
             frame_size = width * height * 3
             frames_read = 0
             try:
+                # Wait briefly until ffmpeg starts producing frames
+                startup_deadline = time.time() + float(os.getenv('STREAM_BUFFER_TIMEOUT_S', '1.0'))
                 while not stop_flag.is_set():
                     if proc.stdout is None:
                         break
-                    buf = proc.stdout.read(frame_size)
+                    # If no data yet, avoid busy-waiting on empty pipe
+                    if proc.stdout.peek(1) if hasattr(proc.stdout, 'peek') else True:
+                        buf = proc.stdout.read(frame_size)
+                    else:
+                        if time.time() > startup_deadline:
+                            break
+                        time.sleep(0.01)
+                        continue
                     if not buf or len(buf) < frame_size:
                         break
                     frame = np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 3))

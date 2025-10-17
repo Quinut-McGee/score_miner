@@ -206,6 +206,19 @@ async def process_challenge(
                 # Fallback: if direct URL produced zero frames, retry with local file path
                 if is_url and (not tracking_data.get("frames")):
                     logger.warning("Direct URL streaming returned 0 frames, retrying with local file")
+                    # If we have an in-progress streaming download, wait briefly for bytes to accumulate
+                    min_bytes = int(os.getenv("STREAM_MIN_START_BYTES", str(3 * 1024 * 1024)))
+                    buffer_deadline = asyncio.get_event_loop().time() + float(os.getenv("STREAM_BUFFER_TIMEOUT_S", "1.0"))
+                    try:
+                        while asyncio.get_event_loop().time() < buffer_deadline:
+                            try:
+                                if Path(video_path).stat().st_size >= min_bytes:
+                                    break
+                            except FileNotFoundError:
+                                pass
+                            await asyncio.sleep(0.05)
+                    except Exception:
+                        pass
                     tracking_data = await process_soccer_video(
                         str(video_path),
                         model_manager,
