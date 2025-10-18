@@ -84,9 +84,19 @@ async def download_video(url: str) -> Path:
             except Exception:
                 http2_available = False
                 logger.warning("ENABLE_HTTP2=1 but 'h2' is not installed; falling back to HTTP/1.1")
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True, http2=http2_available) as client:
-            # First request to get the redirect headers only (headers=True avoids double body buffering)
-            response = await client.get(url, follow_redirects=True)
+        limits = httpx.Limits(
+            max_connections=max(20, parallel_workers * 2),
+            max_keepalive_connections=max(20, parallel_workers * 2)
+        )
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True, http2=http2_available, limits=limits) as client:
+            # Use HEAD to get headers quickly; fallback to GET if HEAD not supported
+            try:
+                response = await client.head(url, follow_redirects=True)
+                # Some servers don't return headers on HEAD properly; fallback check
+                if response.status_code >= 400 or not response.headers:
+                    raise httpx.HTTPError("HEAD not supported or no headers")
+            except Exception:
+                response = await client.get(url, follow_redirects=True)
             
             if "drive.google.com" in url:
                 # For Google Drive, we need to handle the download URL specially
@@ -113,7 +123,7 @@ async def download_video(url: str) -> Path:
                         except Exception:
                             content_length = None
                     # Probe range support
-                    probe = await client.get(str(response.url), headers={"Range": "bytes=0-0"})
+                    probe = await client.get(str(response.url), headers={"Range": "bytes=0-0", "Connection": "keep-alive"})
                     accept_ranges = response.headers.get('accept-ranges', '')
                     if (probe.status_code in (206, 200)) and ("bytes" in accept_ranges or probe.status_code == 206) and content_length is not None and content_length > 0:
                         logger.info(f"Using parallel range download: {parallel_workers} workers for {content_length/1024/1024:.1f} MB")
