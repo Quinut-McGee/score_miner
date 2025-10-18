@@ -6,6 +6,54 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from loguru import logger
 import asyncio
 import os
+from typing import Optional, Tuple, List
+
+async def _parallel_range_download(client: httpx.AsyncClient, url: str, content_length: int, workers: int) -> Path:
+    """
+    Download a file using parallel HTTP range requests.
+
+    Args:
+        client: Shared AsyncClient
+        url: Source URL
+        content_length: Total file size in bytes
+        workers: Number of parallel ranges
+
+    Returns:
+        Path to the completed temp file
+    """
+    # Create temp file and pre-allocate size
+    temp_fd, temp_path = tempfile.mkstemp(suffix='.mp4')
+    os.close(temp_fd)
+    # Pre-allocate size to reduce fragmentation
+    with open(temp_path, 'wb') as f:
+        f.truncate(content_length)
+
+    chunk_size = max(256 * 1024, content_length // max(1, workers))
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    while start < content_length:
+        end = min(content_length - 1, start + chunk_size - 1)
+        ranges.append((start, end))
+        start = end + 1
+
+    async def fetch_range(rng: Tuple[int, int]):
+        start_byte, end_byte = rng
+        headers = {"Range": f"bytes={start_byte}-{end_byte}"}
+        # Use a separate connection for each range for maximum throughput
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        data = resp.content
+        if len(data) != (end_byte - start_byte + 1):
+            # Some servers ignore Range; fail fast to fallback
+            raise HTTPException(status_code=500, detail="Range request returned unexpected size")
+        # Write to file at correct offset
+        with open(temp_path, 'r+b', buffering=0) as f:
+            f.seek(start_byte)
+            f.write(data)
+
+    await asyncio.gather(*[fetch_range(r) for r in ranges])
+    return Path(temp_path)
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 async def download_video(url: str) -> Path:
@@ -24,7 +72,9 @@ async def download_video(url: str) -> Path:
     """
     try:
         # SPEED OPTIMIZED: Use longer timeout and streaming
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+        enable_parallel = os.getenv("ENABLE_PARALLEL_DOWNLOAD", "1") in ("1", "true", "True")
+        parallel_workers = int(os.getenv("PARALLEL_DOWNLOAD_WORKERS", "8"))
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True, http2=True) as client:
             # First request to get the redirect headers only (headers=True avoids double body buffering)
             response = await client.get(url, follow_redirects=True)
             
@@ -41,6 +91,25 @@ async def download_video(url: str) -> Path:
                     response = await client.get(download_url, follow_redirects=True)
             
             response.raise_for_status()
+
+            # Try parallel range download when supported
+            if enable_parallel:
+                try:
+                    # Determine content length and range support
+                    content_length: Optional[int] = None
+                    if response.headers.get('content-length'):
+                        try:
+                            content_length = int(response.headers['content-length'])
+                        except Exception:
+                            content_length = None
+                    # Probe range support
+                    probe = await client.get(str(response.url), headers={"Range": "bytes=0-0"})
+                    accept_ranges = response.headers.get('accept-ranges', '')
+                    if (probe.status_code in (206, 200)) and ("bytes" in accept_ranges or probe.status_code == 206) and content_length is not None and content_length > 0:
+                        logger.info(f"Using parallel range download: {parallel_workers} workers for {content_length/1024/1024:.1f} MB")
+                        return await _parallel_range_download(client, str(response.url), content_length, max(2, parallel_workers))
+                except Exception as e:
+                    logger.warning(f"Parallel download not used, falling back to streaming: {e}")
             
             # SPEED OPTIMIZED: Stream to file in chunks for faster access, without buffering full content in memory
             temp_fd, temp_path = tempfile.mkstemp(suffix='.mp4')
