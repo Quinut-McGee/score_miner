@@ -46,6 +46,9 @@ async def process_soccer_video(
     start_time = time.time()
     # Hard time budget cutoff (env-tunable) to stay competitive
     time_budget_s = float(os.getenv("TIME_BUDGET_S", "8.0"))
+    # Optionally start budget after the first frame to avoid 0-frame exits
+    budget_after_first = os.getenv("START_BUDGET_AFTER_FIRST_FRAME", "1") in ("1", "true", "True")
+    budget_start_time = start_time
     
     try:
         video_processor = VideoProcessor(
@@ -91,6 +94,7 @@ async def process_soccer_video(
         # Pre-allocate list for better memory performance
         frames_list = []
         
+        first_frame_seen = False
         async for frame_data in processor.process_batched_frames(
             frame_generator,
             player_model,
@@ -113,6 +117,10 @@ async def process_soccer_video(
                 ] if len(frame_data["tracker_ids"]) > 0 else []
             }
             frames_list.append(converted_frame)
+            if not first_frame_seen:
+                first_frame_seen = True
+                if budget_after_first:
+                    budget_start_time = time.time()
 
             # Log progress every 100 frames
             frame_number = frame_data["frame_number"]
@@ -122,7 +130,7 @@ async def process_soccer_video(
                 logger.info(f"Processed {frame_number} frames in {elapsed:.1f}s ({fps:.2f} fps)")
 
             # Enforce time budget cutoff
-            if time.time() - start_time >= time_budget_s:
+            if time.time() - budget_start_time >= time_budget_s:
                 logger.info(f"Time budget of {time_budget_s:.1f}s reached, finishing early with {len(frames_list)} frames")
                 break
 

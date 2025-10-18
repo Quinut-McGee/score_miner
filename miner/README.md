@@ -288,3 +288,80 @@ python scripts/benchmark_miner.py --url <video_url> --repeats 3
 Recommended metrics to log:
 - First-frame latency (s), Decode FPS, Inference FPS, End-to-end time (s)
 - GPU utilization (%), VRAM used (GB), CPU utilization (%)
+
+## Recent Changes (Performance)
+
+- Video I/O
+  - Background decode thread with bounded queue and frame stride.
+  - Direct URL streaming option; streaming download with initial buffer wait and safe fallback to temp file.
+  - NVDEC (ffmpeg CUDA) path with fixed-scale raw output to avoid metadata probing latency; low-latency flags (`-fflags nobuffer`, `-analyzeduration 0`, `-probesize 32k`).
+  - Startup guards: `STREAM_MIN_START_BYTES`, `STREAM_BUFFER_TIMEOUT_S`, `FIRST_FRAME_TIMEOUT_S`.
+
+- Batching and parallelism
+  - Early-batch ramp-up to reduce time-to-first-results (`RAMP_UP`, `RAMP_UP_FIRST_BATCH`).
+  - Double-buffered pipeline: overlap GPU inference (batch N+1) with CPU postprocess (batch N).
+  - Optional speed toggles: `DISABLE_TRACKING` (skip ByteTrack), `SKIP_PITCH` (skip pitch postprocess).
+
+- Models and GPU
+  - FAST_MODE profile with smaller `IMG_SIZE`, higher `CONF_THRESHOLD`, reduced `MAX_DETECTIONS`.
+  - Async model warmup with dtype fix; overlap warmup with download on each challenge.
+  - GPU optimizer: cuDNN benchmark, TF32, memory fraction, thread caps; `torch.compile` gated via `ENABLE_TORCH_COMPILE` (off by default).
+
+- Endpoint robustness
+  - Automatic fallback if direct URL streaming yields 0 frames (wait for buffered bytes, then process temp file).
+  - Hard time budget cutoff via `TIME_BUDGET_S` to ensure competitive responses.
+
+### Fastest Known Settings (aggressive)
+
+```bash
+export DEVICE=cuda
+export USE_NVDEC=1
+export NVDEC_FIXED_SCALE=1
+export NVDEC_OUT_W=416
+export NVDEC_OUT_H=416
+export DIRECT_URL_STREAM=1
+export STREAMING_DOWNLOAD=1
+export STREAM_MIN_START_BYTES=$((3*1024*1024))
+export STREAM_BUFFER_TIMEOUT_S=2.0
+export FIRST_FRAME_TIMEOUT_S=2.5
+
+export FAST_MODE=1
+export IMG_SIZE=416
+export BATCH_SIZE=48
+export FRAME_STRIDE=5
+export PREFETCH_FRAMES=192
+export RAMP_UP=1
+export RAMP_UP_FIRST_BATCH=4
+
+export DISABLE_TRACKING=1
+export SKIP_PITCH=1
+export CONF_THRESHOLD=0.5
+export MAX_DETECTIONS=80
+export TIME_BUDGET_S=2.0
+
+# pm2: apply environment
+pm2 restart sn44-miner --update-env
+```
+
+## Path to ~2s End-to-End
+
+1. TensorRT FP16 engines for player/pitch
+   - Export ONNX; build and cache TRT engines; feature-flagged inference path.
+   - Expected 2–4x model speedup; combine with stride to hit ~2s.
+
+2. Further pipeline overlap
+   - Run player, pitch, and (optional) ball on separate CUDA streams.
+   - Keep double-buffering; overlap H2D transfers with compute using pinned memory.
+
+3. Memory pipeline upgrades
+   - Pinned host buffers, `non_blocking=True` H2D, pre-allocated tensors per batch size.
+
+4. Input latency hardening
+   - Maintain NVDEC fixed-scale path; tune `STREAM_BUFFER_TIMEOUT_S` per origin.
+   - Auto-switch to file mode if URL stream delivers <1 frame within `FIRST_FRAME_TIMEOUT_S`.
+
+5. Adaptive sampling
+   - Increase `FRAME_STRIDE` dynamically on low-motion segments to reduce frames.
+
+6. Stable PM2 configuration
+   - Persist env in `miner/ecosystem.config.js` and reload with `--update-env` to avoid drift.

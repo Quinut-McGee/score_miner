@@ -38,6 +38,7 @@ class BatchFrameProcessor:
         # Optional fast-mode toggles
         self.disable_tracking = os.getenv("DISABLE_TRACKING", "0") in ("1", "true", "True")
         self.skip_pitch = os.getenv("SKIP_PITCH", "0") in ("1", "true", "True")
+        self.early_flush_first = os.getenv("EARLY_FLUSH_FIRST_FRAME", "1") in ("1", "true", "True")
         logger.info(f"BatchFrameProcessor initialized with batch_size={batch_size}")
 
     async def process_batched_frames(
@@ -71,12 +72,27 @@ class BatchFrameProcessor:
         # Initialize double-buffering state
         prev_future: Optional[concurrent.futures.Future] = None
         prev_frame_numbers: List[int] = []
+        first_frame_emitted = False
 
         async for frame_number, frame in frame_generator:
             batch_frames.append(frame)
             batch_numbers.append(frame_number)
 
             # Process batch when full or if this is the last frame
+            # Early flush: if enabled, emit the very first frame ASAP
+            if self.early_flush_first and not first_frame_emitted and len(batch_frames) >= 1:
+                # Run a minimal batch of size 1, then continue normal batching
+                mini_frames = [batch_frames.pop(0)]
+                mini_numbers = [batch_numbers.pop(0)]
+                # Submit and wait immediately
+                mini_future = self._submit_infer_batch(mini_frames, player_model, pitch_model, player_kwargs, pitch_kwargs)
+                pitch_results, player_results = await self._wait_future(mini_future)
+                async for frame_data in self._postprocess_batch(mini_numbers, pitch_results, player_results, tracker):
+                    yield frame_data
+                first_frame_emitted = True
+                # Recompute target (first batch may still be pending)
+                current_target = (self.first_batch_target if first_batch_pending else self.batch_size)
+
             if len(batch_frames) >= current_target:
                 # Pipeline: submit inference for the next batch before postprocessing the previous
                 if prev_future is None:
