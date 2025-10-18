@@ -40,7 +40,8 @@ async def benchmark_configuration(
     frame_stride: int,
     img_size: int,
     prefetch_frames: int,
-    device: str = "cuda"
+    device: str = "cuda",
+    is_url: bool = False,
 ):
     """
     Benchmark a specific configuration.
@@ -103,7 +104,7 @@ async def benchmark_configuration(
     video_processor.VideoProcessor.__init__ = patched_init
     
     try:
-        result = await process_soccer_video(video_path, model_manager)
+        result = await process_soccer_video(video_path, model_manager, is_url=is_url)
         
         end_time = time.time()
         total_time = end_time - start_time
@@ -162,7 +163,7 @@ async def benchmark_configuration(
             torch.cuda.empty_cache()
 
 
-async def run_benchmarks(video_path: str, device: str = "cuda", quick: bool = False):
+async def run_benchmarks(video_path: str, device: str = "cuda", quick: bool = False, is_url: bool = False):
     """
     Run multiple benchmark configurations to find optimal settings.
     
@@ -207,6 +208,7 @@ async def run_benchmarks(video_path: str, device: str = "cuda", quick: bool = Fa
         result = await benchmark_configuration(
             video_path=video_path,
             device=device,
+            is_url=is_url,
             **config
         )
         results.append(result)
@@ -258,7 +260,10 @@ async def run_benchmarks(video_path: str, device: str = "cuda", quick: bool = Fa
         logger.info(f"  Image Size: {best['img_size']}px")
         logger.info(f"  Prefetch Frames: {best['prefetch_frames']}")
         logger.info(f"  Expected FPS: {best['fps']:.2f}")
-        logger.info(f"  Expected Time (750 frames): {750 / best['fps']:.2f}s")
+        if best['fps'] > 0:
+            logger.info(f"  Expected Time (750 frames): {750 / best['fps']:.2f}s")
+        else:
+            logger.info(f"  Expected Time (750 frames): N/A (zero FPS)")
         
         # Calculate speedup vs baseline
         baseline = next((r for r in results if r.get('batch_size') == 4 and r.get('frame_stride') == 1), None)
@@ -277,30 +282,40 @@ async def main():
                        help='Device to use for inference')
     parser.add_argument('--quick', action='store_true', 
                        help='Run quick test (only current config)')
+    parser.add_argument('--direct-url', action='store_true',
+                       help='Use URL directly for decoding (no download)')
     
     args = parser.parse_args()
     
     # Get video path
     if args.video_path:
         video_path = args.video_path
+        is_url = False
     elif args.video_url:
-        logger.info(f"Downloading video from {args.video_url}...")
-        video_path = await download_video(args.video_url)
-        logger.info(f"Video downloaded to {video_path}")
+        if args.direct_url:
+            video_path = args.video_url
+            is_url = True
+            logger.info("Using direct URL for decoding (no download)")
+        else:
+            logger.info(f"Downloading video from {args.video_url}...")
+            video_path = await download_video(args.video_url)
+            is_url = False
+            logger.info(f"Video downloaded to {video_path}")
     else:
         logger.error("Please provide either --video-path or --video-url")
         return 1
     
     # Verify video exists
-    if not Path(video_path).exists():
-        logger.error(f"Video file not found: {video_path}")
-        return 1
+    if not (isinstance(video_path, str) and (video_path.startswith('http://') or video_path.startswith('https://'))):
+        if not Path(video_path).exists():
+            logger.error(f"Video file not found: {video_path}")
+            return 1
     
     # Run benchmarks
-    await run_benchmarks(video_path, device=args.device, quick=args.quick)
+    await run_benchmarks(video_path, device=args.device, quick=args.quick, is_url=is_url)
     
     # Cleanup if downloaded
-    if args.video_url:
+    if args.video_url and not args.direct_url:
         try:
             Path(video_path).unlink()
         except:

@@ -161,12 +161,13 @@ class VideoProcessor:
             frame_size = width * height * 3
             frames_read = 0
             try:
-                # Wait briefly until ffmpeg starts producing frames
-                startup_deadline = time.time() + float(os.getenv('STREAM_BUFFER_TIMEOUT_S', '1.0'))
+                # Wait briefly until ffmpeg starts producing frames; if it doesn't, fall back to OpenCV
+                startup_deadline = time.time() + float(os.getenv('FIRST_FRAME_TIMEOUT_S', '2.0'))
+                produced_any = False
                 while not stop_flag.is_set():
                     if proc.stdout is None:
                         break
-                    # If no data yet, avoid busy-waiting on empty pipe
+                    # Avoid busy-waiting on empty pipe
                     if hasattr(proc.stdout, 'peek'):
                         ready = len(proc.stdout.peek(1)) > 0
                     else:
@@ -175,12 +176,19 @@ class VideoProcessor:
                         buf = proc.stdout.read(frame_size)
                     else:
                         if time.time() > startup_deadline:
-                            break
+                            # No data in time; switch to OpenCV fallback
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
+                            reader_opencv()
+                            return
                         time.sleep(0.01)
                         continue
                     if not buf or len(buf) < frame_size:
                         break
                     frame = np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 3))
+                    produced_any = True
                     frames_read += self.frame_stride  # approximate index advance with stride
                     try:
                         q.put((frames_read - 1, frame), timeout=0.5)
@@ -191,6 +199,10 @@ class VideoProcessor:
                                 break
                             except queue.Full:
                                 continue
+                # If ffmpeg exited without producing any frame, fallback once
+                if not produced_any and not stop_flag.is_set():
+                    reader_opencv()
+                    return
             finally:
                 try:
                     q.put(None, timeout=0.1)

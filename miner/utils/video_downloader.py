@@ -25,7 +25,7 @@ async def download_video(url: str) -> Path:
     try:
         # SPEED OPTIMIZED: Use longer timeout and streaming
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            # First request to get the redirect
+            # First request to get the redirect headers only (headers=True avoids double body buffering)
             response = await client.get(url, follow_redirects=True)
             
             if "drive.google.com" in url:
@@ -42,17 +42,18 @@ async def download_video(url: str) -> Path:
             
             response.raise_for_status()
             
-            # SPEED OPTIMIZED: Stream to file in chunks for faster access
-            # Create temp file with .mp4 extension
+            # SPEED OPTIMIZED: Stream to file in chunks for faster access, without buffering full content in memory
             temp_fd, temp_path = tempfile.mkstemp(suffix='.mp4')
-            
-            # Write in large chunks for better I/O performance
             chunk_size = 1024 * 1024  # 1MB chunks
             total_downloaded = 0
-            
-            with os.fdopen(temp_fd, 'wb') as temp_file:
-                temp_file.write(response.content)
-                total_downloaded = len(response.content)
+
+            # Re-issue as stream to avoid loading entire body
+            async with client.stream('GET', str(response.url)) as stream_resp:
+                stream_resp.raise_for_status()
+                with os.fdopen(temp_fd, 'wb') as temp_file:
+                    async for chunk in stream_resp.aiter_bytes(chunk_size=chunk_size):
+                        temp_file.write(chunk)
+                        total_downloaded += len(chunk)
             
             logger.info(f"Video downloaded successfully ({total_downloaded / 1024 / 1024:.1f} MB) to {temp_path}")
             return Path(temp_path)
