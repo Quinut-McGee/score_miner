@@ -64,29 +64,37 @@ class VideoProcessor:
         stop_flag = threading.Event()
 
         if use_nvdec:
-            width = 0
-            height = 0
-            try:
-                # Try ffprobe first for URLs (faster/more reliable metadata)
-                if is_url:
-                    probe_cmd = f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x {shlex.quote(str(video_source))}"
-                    out = subprocess.check_output(shlex.split(probe_cmd), stderr=subprocess.DEVNULL, timeout=2)
-                    parts = out.decode().strip().split('x')
-                    if len(parts) == 2:
-                        width = int(parts[0])
-                        height = int(parts[1])
+            # Fixed-scale NVDEC path to avoid probing dimensions
+            nvdec_fixed = os.getenv('NVDEC_FIXED_SCALE', '1') in ('1', 'true', 'True')
+            if nvdec_fixed:
+                width = int(os.getenv('NVDEC_OUT_W', os.getenv('IMG_SIZE', '416')))
+                height = int(os.getenv('NVDEC_OUT_H', str(width)))
                 if width <= 0 or height <= 0:
-                    # Fallback to OpenCV probe for local files or if ffprobe failed
-                    cap_probe = cv2.VideoCapture(str(video_source))
-                    if cap_probe.isOpened():
-                        width = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
-                        height = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
-                    cap_probe.release()
-            except Exception:
-                pass
-            if width <= 0 or height <= 0:
-                logger.warning("NVDEC probe failed to get dimensions; falling back to OpenCV decode")
-                use_nvdec = False
+                    width, height = 416, 416
+            else:
+                width = 0
+                height = 0
+                try:
+                    # Try ffprobe first for URLs (faster/more reliable metadata)
+                    if is_url:
+                        probe_cmd = f"ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x {shlex.quote(str(video_source))}"
+                        out = subprocess.check_output(shlex.split(probe_cmd), stderr=subprocess.DEVNULL, timeout=2)
+                        parts = out.decode().strip().split('x')
+                        if len(parts) == 2:
+                            width = int(parts[0])
+                            height = int(parts[1])
+                    if width <= 0 or height <= 0:
+                        # Fallback to OpenCV probe for local files or if ffprobe failed
+                        cap_probe = cv2.VideoCapture(str(video_source))
+                        if cap_probe.isOpened():
+                            width = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 0
+                            height = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 0
+                        cap_probe.release()
+                except Exception:
+                    pass
+                if width <= 0 or height <= 0:
+                    logger.warning("NVDEC probe failed to get dimensions; falling back to OpenCV decode")
+                    use_nvdec = False
 
         def reader_opencv() -> None:
             cap = cv2.VideoCapture(str(video_source))
@@ -131,11 +139,12 @@ class VideoProcessor:
             # Use ffmpeg with NVDEC to decode and pipe BGR frames
             # Apply stride with select to reduce decode work
             input_arg = shlex.quote(str(video_source))
-            # If URL, let ffmpeg stream directly (fast start)
+            stride = max(1, self.frame_stride)
+            # Fixed-scale output to avoid width/height probing; add low-latency flags
             cmd = (
-                f"ffmpeg -v error -hwaccel cuda -c:v h264_cuvid -i {input_arg} "
-                f"-vf select='not(mod(n,{max(1, self.frame_stride)}))' "
-                f"-f rawvideo -pix_fmt bgr24 -"
+                f"ffmpeg -hide_banner -loglevel error -nostdin "
+                f"-hwaccel cuda -c:v h264_cuvid -fflags nobuffer -flags low_delay -analyzeduration 0 -probesize 32k "
+                f"-i {input_arg} -vf scale={width}:{height},select='not(mod(n,{stride}))' -f rawvideo -pix_fmt bgr24 -"
             )
             try:
                 proc = subprocess.Popen(
