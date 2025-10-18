@@ -21,7 +21,7 @@ from miner.utils.model_manager import ModelManager
 from miner.utils.video_processor import VideoProcessor
 from miner.utils.batch_processor import BatchFrameProcessor, NoBatchProcessor
 from miner.utils.shared import miner_lock
-from miner.utils.video_downloader import download_video, download_video_streaming, download_video_partial
+from miner.utils.video_downloader import download_video, download_video_streaming, download_video_partial, download_video_chunked_streaming
 
 logger = get_logger(__name__)
 
@@ -176,10 +176,14 @@ async def process_challenge(
             
             # Overlap video download and model warmup
             # Choose download strategy based on env
+            use_chunked = os.getenv("CHUNKED_STREAMING", "0") in ("1", "true", "True")
             use_partial = os.getenv("PARTIAL_DOWNLOAD", "1") in ("1", "true", "True")
             use_streaming = os.getenv("STREAMING_DOWNLOAD", "0") in ("1", "true", "True")
             
-            if use_partial:
+            if use_chunked:
+                # ULTRA-FAST: Stream with immediate file availability (download overlaps with decode)
+                download_task = asyncio.create_task(download_video_chunked_streaming(video_url))
+            elif use_partial:
                 # SPEED TRICK: Download only first N MB (default 4MB) for sub-1s download
                 download_task = asyncio.create_task(download_video_partial(video_url))
             elif use_streaming:

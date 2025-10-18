@@ -97,14 +97,15 @@ class VideoProcessor:
                     use_nvdec = False
 
         def reader_opencv() -> None:
-            # If the source is a local file produced by streaming download, wait for minimum bytes
+            # AGGRESSIVE: Minimal wait for partial downloads (they're already complete)
             if isinstance(video_source, str) and os.path.exists(video_source) and not is_url:
                 try:
-                    min_bytes = int(os.getenv('STREAM_MIN_START_BYTES', str(2 * 1024 * 1024)))
-                    min_bytes = max(512 * 1024, min(min_bytes, 16 * 1024 * 1024))
+                    # For partial downloads, file is complete - only wait if truly tiny
+                    min_bytes = int(os.getenv('STREAM_MIN_START_BYTES', str(512 * 1024)))  # 512 KB min
+                    min_bytes = max(256 * 1024, min(min_bytes, 2 * 1024 * 1024))  # Much lower threshold
                 except Exception:
-                    min_bytes = 2 * 1024 * 1024
-                start_deadline = time.time() + float(os.getenv('STREAM_BUFFER_TIMEOUT_S', '1.0'))
+                    min_bytes = 512 * 1024
+                start_deadline = time.time() + float(os.getenv('STREAM_BUFFER_TIMEOUT_S', '0.2'))  # Much shorter
                 while not stop_flag.is_set():
                     try:
                         current_size = os.path.getsize(video_source)
@@ -114,12 +115,15 @@ class VideoProcessor:
                         pass
                     if time.time() > start_deadline:
                         break
-                    time.sleep(0.02)
-            cap = cv2.VideoCapture(str(video_source))
-            # Best-effort low-latency settings
+                    time.sleep(0.01)  # Faster polling
+            
+            # AGGRESSIVE: Open video with minimal buffering and fastest backend
+            cap = cv2.VideoCapture(str(video_source), cv2.CAP_FFMPEG)
+            
+            # Ultra-low-latency settings
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimal buffer
             if self.device == "cuda":
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             try:
                 frames_read = 0
                 while not stop_flag.is_set():

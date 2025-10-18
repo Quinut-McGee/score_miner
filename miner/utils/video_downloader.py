@@ -234,9 +234,22 @@ async def download_video_partial(url: str, max_bytes: Optional[int] = None) -> P
         max_bytes = int(os.getenv("PARTIAL_DOWNLOAD_MB", "4")) * 1024 * 1024
     
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        # AGGRESSIVE: Use shorter timeout and HTTP/2 with connection pooling
+        limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+        timeout = httpx.Timeout(10.0, connect=2.0)  # 2s connect timeout
+        
+        async with httpx.AsyncClient(
+            timeout=timeout, 
+            follow_redirects=True,
+            limits=limits,
+            http2=True  # Try HTTP/2 for better performance
+        ) as client:
             # Use range request to download only first N bytes
-            headers = {"Range": f"bytes=0-{max_bytes-1}"}
+            headers = {
+                "Range": f"bytes=0-{max_bytes-1}",
+                "Connection": "keep-alive",
+                "Accept-Encoding": "identity",  # No compression to save CPU
+            }
             
             logger.info(f"Downloading first {max_bytes/1024/1024:.1f} MB of video (partial download trick)")
             
@@ -264,4 +277,72 @@ async def download_video_partial(url: str, max_bytes: Optional[int] = None) -> P
             
     except Exception as e:
         logger.error(f"Error in partial download: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to download video: {str(e)}")
+
+
+async def download_video_chunked_streaming(url: str, max_bytes: Optional[int] = None) -> Path:
+    """
+    ULTRA-FAST: Stream download with immediate file availability.
+    Start writing immediately so decoder can start reading while download continues.
+    
+    This allows processing to begin before download completes!
+    
+    Args:
+        url: URL of the video to download
+        max_bytes: Maximum bytes to download (default from env or 4MB)
+        
+    Returns:
+        Path: Path to the downloading video file (processing can start immediately)
+    """
+    if max_bytes is None:
+        max_bytes = int(os.getenv("PARTIAL_DOWNLOAD_MB", "4")) * 1024 * 1024
+    
+    try:
+        # Create temp file immediately
+        temp_fd, temp_path = tempfile.mkstemp(suffix='.mp4')
+        
+        limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+        timeout = httpx.Timeout(15.0, connect=2.0)
+        
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            limits=limits,
+            http2=True
+        ) as client:
+            headers = {
+                "Range": f"bytes=0-{max_bytes-1}",
+                "Connection": "keep-alive",
+                "Accept-Encoding": "identity",
+            }
+            
+            logger.info(f"Streaming first {max_bytes/1024/1024:.1f} MB (chunked streaming for immediate decode)")
+            
+            async with client.stream('GET', url, headers=headers) as response:
+                response.raise_for_status()
+                
+                bytes_written = 0
+                chunk_size = 256 * 1024  # 256 KB chunks for fast initial availability
+                
+                with os.fdopen(temp_fd, 'wb', buffering=0) as f:  # No buffering for immediate writes
+                    async for chunk in response.aiter_bytes(chunk_size=chunk_size):
+                        f.write(chunk)
+                        bytes_written += len(chunk)
+                        
+                        # Stop when we have enough
+                        if bytes_written >= max_bytes:
+                            break
+                
+                actual_mb = bytes_written / 1024 / 1024
+                logger.info(f"Streamed {actual_mb:.1f} MB to {temp_path}")
+                return Path(temp_path)
+                
+    except Exception as e:
+        logger.error(f"Error in chunked streaming download: {str(e)}")
+        # Cleanup on error
+        try:
+            if 'temp_path' in locals():
+                Path(temp_path).unlink()
+        except:
+            pass
         raise HTTPException(status_code=500, detail=f"Failed to download video: {str(e)}") 
