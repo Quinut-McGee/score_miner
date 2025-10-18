@@ -74,7 +74,17 @@ async def download_video(url: str) -> Path:
         # SPEED OPTIMIZED: Use longer timeout and streaming
         enable_parallel = os.getenv("ENABLE_PARALLEL_DOWNLOAD", "1") in ("1", "true", "True")
         parallel_workers = int(os.getenv("PARALLEL_DOWNLOAD_WORKERS", "8"))
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True, http2=True) as client:
+        # Enable HTTP/2 only if explicitly requested AND the 'h2' package is installed
+        enable_http2 = os.getenv("ENABLE_HTTP2", "0") in ("1", "true", "True")
+        http2_available = False
+        if enable_http2:
+            try:
+                import h2  # noqa: F401
+                http2_available = True
+            except Exception:
+                http2_available = False
+                logger.warning("ENABLE_HTTP2=1 but 'h2' is not installed; falling back to HTTP/1.1")
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True, http2=http2_available) as client:
             # First request to get the redirect headers only (headers=True avoids double body buffering)
             response = await client.get(url, follow_redirects=True)
             
