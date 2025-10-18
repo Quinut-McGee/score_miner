@@ -7,6 +7,7 @@ from loguru import logger
 import asyncio
 import os
 from typing import Optional, Tuple, List
+from miner.utils.connection_pool import get_pool
 
 async def _parallel_range_download(client: httpx.AsyncClient, url: str, content_length: int, workers: int) -> Path:
     """
@@ -223,6 +224,8 @@ async def download_video_partial(url: str, max_bytes: Optional[int] = None) -> P
     
     This is the "trick" to sub-1s download times: don't download the whole file!
     
+    Uses persistent connection pool to eliminate 2.4s connection setup overhead.
+    
     Args:
         url: URL of the video to download
         max_bytes: Maximum bytes to download (default from env or 4MB)
@@ -234,16 +237,31 @@ async def download_video_partial(url: str, max_bytes: Optional[int] = None) -> P
         max_bytes = int(os.getenv("PARTIAL_DOWNLOAD_MB", "4")) * 1024 * 1024
     
     try:
-        # AGGRESSIVE: Use shorter timeout and HTTP/2 with connection pooling
-        limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
-        timeout = httpx.Timeout(10.0, connect=2.0)  # 2s connect timeout
+        # Use persistent connection pool (eliminates 2.4s connection setup!)
+        use_pool = os.getenv("USE_CONNECTION_POOL", "1") in ("1", "true", "True")
         
-        async with httpx.AsyncClient(
-            timeout=timeout, 
-            follow_redirects=True,
-            limits=limits,
-            http2=True  # Try HTTP/2 for better performance
-        ) as client:
+        if use_pool:
+            client = get_pool().client
+        else:
+            # Fallback to one-off client
+            limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+            timeout = httpx.Timeout(10.0, connect=2.0)
+            
+            try:
+                import h2  # noqa: F401
+                http2_enabled = True
+            except ImportError:
+                http2_enabled = False
+                logger.warning("HTTP/2 not available - install with: pip install httpx[http2]")
+            
+            client = httpx.AsyncClient(
+                timeout=timeout, 
+                follow_redirects=True,
+                limits=limits,
+                http2=http2_enabled
+            )
+        
+        try:
             # Use range request to download only first N bytes
             headers = {
                 "Range": f"bytes=0-{max_bytes-1}",
@@ -274,6 +292,11 @@ async def download_video_partial(url: str, max_bytes: Optional[int] = None) -> P
             actual_mb = len(data) / 1024 / 1024
             logger.info(f"Partial video downloaded successfully ({actual_mb:.1f} MB) to {temp_path}")
             return Path(temp_path)
+        
+        finally:
+            # Only close if we created a one-off client
+            if not use_pool and isinstance(client, httpx.AsyncClient):
+                await client.aclose()
             
     except Exception as e:
         logger.error(f"Error in partial download: {str(e)}")
@@ -286,6 +309,7 @@ async def download_video_chunked_streaming(url: str, max_bytes: Optional[int] = 
     Start writing immediately so decoder can start reading while download continues.
     
     This allows processing to begin before download completes!
+    Uses persistent connection pool for even faster connection setup.
     
     Args:
         url: URL of the video to download
@@ -301,15 +325,29 @@ async def download_video_chunked_streaming(url: str, max_bytes: Optional[int] = 
         # Create temp file immediately
         temp_fd, temp_path = tempfile.mkstemp(suffix='.mp4')
         
-        limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
-        timeout = httpx.Timeout(15.0, connect=2.0)
+        # Use persistent connection pool
+        use_pool = os.getenv("USE_CONNECTION_POOL", "1") in ("1", "true", "True")
         
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            follow_redirects=True,
-            limits=limits,
-            http2=True
-        ) as client:
+        if use_pool:
+            client = get_pool().client
+        else:
+            limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+            timeout = httpx.Timeout(15.0, connect=2.0)
+            
+            try:
+                import h2  # noqa: F401
+                http2_enabled = True
+            except ImportError:
+                http2_enabled = False
+            
+            client = httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=True,
+                limits=limits,
+                http2=http2_enabled
+            )
+        
+        try:
             headers = {
                 "Range": f"bytes=0-{max_bytes-1}",
                 "Connection": "keep-alive",
@@ -336,6 +374,11 @@ async def download_video_chunked_streaming(url: str, max_bytes: Optional[int] = 
                 actual_mb = bytes_written / 1024 / 1024
                 logger.info(f"Streamed {actual_mb:.1f} MB to {temp_path}")
                 return Path(temp_path)
+        
+        finally:
+            # Only close if we created a one-off client
+            if not use_pool and isinstance(client, httpx.AsyncClient):
+                await client.aclose()
                 
     except Exception as e:
         logger.error(f"Error in chunked streaming download: {str(e)}")
