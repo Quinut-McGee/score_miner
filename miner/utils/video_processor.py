@@ -206,6 +206,7 @@ class VideoProcessor:
         t.start()
 
         yielded_frame_count = 0
+        first_frame_deadline = start_time + float(os.getenv('FIRST_FRAME_TIMEOUT_S', '2.0'))
         try:
             while True:
                 elapsed_time = time.time() - start_time

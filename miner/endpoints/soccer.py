@@ -203,8 +203,8 @@ async def process_challenge(
                     is_url=is_url
                 )
 
-                # Fallback: if direct URL produced zero frames, retry with local file path
-                if is_url and (not tracking_data.get("frames")):
+                # Fallback: if direct URL produced zero frames or slow start, retry with local file path
+                if is_url and ((not tracking_data.get("frames")) or tracking_data.get("slow_start")):
                     logger.warning("Direct URL streaming returned 0 frames, retrying with local file")
                     # If we have an in-progress streaming download, wait briefly for bytes to accumulate
                     min_bytes = int(os.getenv("STREAM_MIN_START_BYTES", str(3 * 1024 * 1024)))
