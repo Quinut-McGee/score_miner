@@ -29,7 +29,7 @@ if str(project_root / "miner") not in sys.path:
 
 from miner.utils.model_manager import ModelManager
 from miner.endpoints.soccer import process_soccer_video
-from miner.utils.video_downloader import download_video
+from miner.utils.video_downloader import download_video, download_video_streaming
 from loguru import logger
 import torch
 
@@ -284,6 +284,8 @@ async def main():
                        help='Run quick test (only current config)')
     parser.add_argument('--direct-url', action='store_true',
                        help='Use URL directly for decoding (no download)')
+    parser.add_argument('--streaming-download', action='store_true',
+                       help='Start processing while the file is still downloading')
     
     args = parser.parse_args()
     
@@ -296,6 +298,11 @@ async def main():
             video_path = args.video_url
             is_url = True
             logger.info("Using direct URL for decoding (no download)")
+        elif args.streaming_download:
+            logger.info(f"Downloading (streaming) video from {args.video_url}...")
+            video_path, bg_task = await download_video_streaming(args.video_url)
+            is_url = False
+            logger.info(f"Streaming to {video_path} (processing starts now; download continues in background)")
         else:
             logger.info(f"Downloading video from {args.video_url}...")
             video_path = await download_video(args.video_url)
@@ -320,6 +327,16 @@ async def main():
             Path(video_path).unlink()
         except:
             pass
+    # Try to let the streaming download finish briefly for cleanup, if used
+    try:
+        if 'bg_task' in locals():
+            import asyncio as _asyncio
+            try:
+                await _asyncio.wait_for(bg_task, timeout=0.1)
+            except Exception:
+                pass
+    except Exception:
+        pass
     
     return 0
 
