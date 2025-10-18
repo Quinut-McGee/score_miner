@@ -97,6 +97,24 @@ class VideoProcessor:
                     use_nvdec = False
 
         def reader_opencv() -> None:
+            # If the source is a local file produced by streaming download, wait for minimum bytes
+            if isinstance(video_source, str) and os.path.exists(video_source) and not is_url:
+                try:
+                    min_bytes = int(os.getenv('STREAM_MIN_START_BYTES', str(2 * 1024 * 1024)))
+                    min_bytes = max(512 * 1024, min(min_bytes, 16 * 1024 * 1024))
+                except Exception:
+                    min_bytes = 2 * 1024 * 1024
+                start_deadline = time.time() + float(os.getenv('STREAM_BUFFER_TIMEOUT_S', '1.0'))
+                while not stop_flag.is_set():
+                    try:
+                        current_size = os.path.getsize(video_source)
+                        if current_size >= min_bytes:
+                            break
+                    except FileNotFoundError:
+                        pass
+                    if time.time() > start_deadline:
+                        break
+                    time.sleep(0.02)
             cap = cv2.VideoCapture(str(video_source))
             # Best-effort low-latency settings
             if self.device == "cuda":
@@ -141,9 +159,12 @@ class VideoProcessor:
             input_arg = shlex.quote(str(video_source))
             stride = max(1, self.frame_stride)
             # Fixed-scale output to avoid width/height probing; add low-latency flags
+            # Add aggressive low-latency and reconnection flags for HTTP
+            http_flags = "-rw_timeout 1000000 -reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_at_eof 1" if is_url else ""
             cmd = (
                 f"ffmpeg -hide_banner -loglevel error -nostdin "
-                f"-hwaccel cuda -c:v h264_cuvid -fflags nobuffer -flags low_delay -analyzeduration 0 -probesize 32k "
+                f"{http_flags} "
+                f"-hwaccel cuda -c:v h264_cuvid -fflags nobuffer -flags low_delay -avioflags direct -analyzeduration 0 -probesize 16k -max_delay 0 "
                 f"-i {input_arg} -vf scale={width}:{height},select='not(mod(n,{stride}))' -f rawvideo -pix_fmt bgr24 -"
             )
             try:
