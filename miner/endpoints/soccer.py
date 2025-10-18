@@ -21,7 +21,7 @@ from miner.utils.model_manager import ModelManager
 from miner.utils.video_processor import VideoProcessor
 from miner.utils.batch_processor import BatchFrameProcessor, NoBatchProcessor
 from miner.utils.shared import miner_lock
-from miner.utils.video_downloader import download_video, download_video_streaming
+from miner.utils.video_downloader import download_video, download_video_streaming, download_video_partial
 
 logger = get_logger(__name__)
 
@@ -175,19 +175,26 @@ async def process_challenge(
             logger.info(f"Processing challenge {challenge_id} with video {video_url}")
             
             # Overlap video download and model warmup
-            # Choose streaming or full download based on env
-            use_streaming = os.getenv("STREAMING_DOWNLOAD", "1") in ("1", "true", "True")
-            if use_streaming:
+            # Choose download strategy based on env
+            use_partial = os.getenv("PARTIAL_DOWNLOAD", "1") in ("1", "true", "True")
+            use_streaming = os.getenv("STREAMING_DOWNLOAD", "0") in ("1", "true", "True")
+            
+            if use_partial:
+                # SPEED TRICK: Download only first N MB (default 4MB) for sub-1s download
+                download_task = asyncio.create_task(download_video_partial(video_url))
+            elif use_streaming:
                 download_task = asyncio.create_task(download_video_streaming(video_url))
             else:
                 download_task = asyncio.create_task(download_video(video_url))
+            
             warmup_task = asyncio.create_task(model_manager.warmup_models())
 
-            if use_streaming:
+            if use_streaming and not use_partial:
                 video_path, background_download = await download_task
             else:
                 video_path = await download_task
                 background_download = None
+            
             # Don't block on warmup if already done; wait up to 1s grace
             try:
                 await asyncio.wait_for(warmup_task, timeout=1.0)

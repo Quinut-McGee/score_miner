@@ -211,4 +211,57 @@ async def download_video_streaming(url: str):
                 
     except Exception as e:
         logger.error(f"Error in streaming download: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to download video: {str(e)}")
+
+
+async def download_video_partial(url: str, max_bytes: Optional[int] = None) -> Path:
+    """
+    SPEED TRICK: Download only the first N MB of video for rapid processing.
+    
+    For competitive subnet operation with stride=5 and ~2s budget, you only need
+    ~20-40 frames, which is typically 1-3 MB of video data.
+    
+    This is the "trick" to sub-1s download times: don't download the whole file!
+    
+    Args:
+        url: URL of the video to download
+        max_bytes: Maximum bytes to download (default from env or 4MB)
+        
+    Returns:
+        Path: Path to the partial video file
+    """
+    if max_bytes is None:
+        max_bytes = int(os.getenv("PARTIAL_DOWNLOAD_MB", "4")) * 1024 * 1024
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            # Use range request to download only first N bytes
+            headers = {"Range": f"bytes=0-{max_bytes-1}"}
+            
+            logger.info(f"Downloading first {max_bytes/1024/1024:.1f} MB of video (partial download trick)")
+            
+            response = await client.get(url, headers=headers)
+            
+            # Handle servers that don't support range requests (fallback to normal download)
+            if response.status_code == 416 or response.status_code == 200:
+                # Server doesn't support range or returned full file anyway
+                data = response.content[:max_bytes]  # Truncate if needed
+            elif response.status_code == 206:
+                # Partial content - exactly what we want
+                data = response.content
+            else:
+                response.raise_for_status()
+                data = response.content[:max_bytes]
+            
+            # Write to temp file
+            temp_fd, temp_path = tempfile.mkstemp(suffix='.mp4')
+            with os.fdopen(temp_fd, 'wb') as temp_file:
+                temp_file.write(data)
+            
+            actual_mb = len(data) / 1024 / 1024
+            logger.info(f"Partial video downloaded successfully ({actual_mb:.1f} MB) to {temp_path}")
+            return Path(temp_path)
+            
+    except Exception as e:
+        logger.error(f"Error in partial download: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to download video: {str(e)}") 

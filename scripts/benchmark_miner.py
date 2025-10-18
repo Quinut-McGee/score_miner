@@ -29,7 +29,7 @@ if str(project_root / "miner") not in sys.path:
 
 from miner.utils.model_manager import ModelManager
 from miner.endpoints.soccer import process_soccer_video
-from miner.utils.video_downloader import download_video, download_video_streaming
+from miner.utils.video_downloader import download_video, download_video_streaming, download_video_partial
 from loguru import logger
 import torch
 
@@ -286,6 +286,10 @@ async def main():
                        help='Use URL directly for decoding (no download)')
     parser.add_argument('--streaming-download', action='store_true',
                        help='Start processing while the file is still downloading')
+    parser.add_argument('--partial-download', action='store_true',
+                       help='Download only first N MB (SPEED TRICK for sub-1s download)')
+    parser.add_argument('--partial-mb', type=int, default=4,
+                       help='How many MB to download in partial mode (default: 4)')
     
     args = parser.parse_args()
     
@@ -298,6 +302,11 @@ async def main():
             video_path = args.video_url
             is_url = True
             logger.info("Using direct URL for decoding (no download)")
+        elif args.partial_download:
+            logger.info(f"Downloading first {args.partial_mb} MB (partial download SPEED TRICK)...")
+            video_path = await download_video_partial(args.video_url, max_bytes=args.partial_mb * 1024 * 1024)
+            is_url = False
+            logger.info(f"Partial video downloaded to {video_path}")
         elif args.streaming_download:
             logger.info(f"Downloading (streaming) video from {args.video_url}...")
             video_path, bg_task = await download_video_streaming(args.video_url)
@@ -325,18 +334,14 @@ async def main():
     if args.video_url and not args.direct_url:
         try:
             Path(video_path).unlink()
-        except:
+        except Exception:
             pass
     # Try to let the streaming download finish briefly for cleanup, if used
-    try:
-        if 'bg_task' in locals():
-            import asyncio as _asyncio
-            try:
-                await _asyncio.wait_for(bg_task, timeout=0.1)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    if 'bg_task' in locals():
+        try:
+            await asyncio.wait_for(bg_task, timeout=0.1)
+        except Exception:
+            pass
     
     return 0
 
